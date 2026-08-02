@@ -75,7 +75,7 @@ MajorLoginRes = _globals_major_res['MajorLoginRes']
 # ========================== CONFIGURATION ==========================
 AES_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])   # "Yg&tc%DEuh6%Zc^8"
 AES_IV = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])  # "6oyZDr22E3ychjM%"
-GUEST_API_URL = "https://jwt-kappa-khaki.vercel.app/token"
+GUEST_API_URL = "https://sheihk-jwt.up.railway.app/token"
 TOKEN_REFRESH_INTERVAL_HOURS = 6
 
 # Global token cache (in‑memory, persists across requests within the same instance)
