@@ -348,28 +348,42 @@ def eat_token_to_jwt(eat_token: str) -> dict:
 
 def guest_to_jwt(uid: str, password: str) -> dict:
     try:
-        params = {"uid": uid, "password": password}
+        params = {
+            "uid": uid,
+            "pass": password
+        }
+        
         resp = requests.get(GUEST_API_URL, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         
-        if data.get("status") == "success":
-            # 🎯 এপিআই থেকে সরাসরি মেইন অ্যাকাউন্ট আইডি এবং রেডিমেড টোকেন নিন
-            account_uid = data.get("account_id") or data.get("uid")
-            jwt_token = data.get("token")  # 👈 ওল্ড কোডে এখানে jwt_token ছিল, এখন ডিরেক্ট "token" ফিল্ডটি নিলাম
-            region = data.get("region", "BD")
+        # বড় হাতের Status এবং ছোট হাতের status উভয়ই হ্যান্ডেল করা হচ্ছে
+        status = data.get("Status") or data.get("status")
+        
+        if status == "success":
+            # API Response অনুযায়ী Capitalized Keys পড়া হচ্ছে
+            account_uid = data.get("account_id") or data.get("uid") or uid
+            jwt_token = data.get("Token") or data.get("token") or data.get("jwt")
+            region = data.get("region") or data.get("lock_region") or "BD"
             
-            if account_uid and jwt_token:
+            if jwt_token:
                 app.logger.info(f"Successfully loaded token for UID: {account_uid}")
                 return {
                     "uid": str(account_uid),
-                    "token": jwt_token,     # এই টোকেনটাই সরাসরি লাইক মারতে চলে যাবে
+                    "token": jwt_token,
                     "region": region,
                     "type": "guest"
                 }
+            else:
+                app.logger.error(f"Token missing in response for UID: {uid}")
+        else:
+            app.logger.error(f"API returned unsuccessful status for UID {uid}: {data}")
+
     except Exception as e:
         app.logger.error(f"Guest token fetch failed for {uid}: {e}")
     return None
+
+
 
 
 # ========================== TOKEN REFRESH ==========================
@@ -456,32 +470,21 @@ def start_background_scheduler():
 def handle_requests():
     global refresh_in_progress, all_tokens
     uid = request.args.get("uid")
-    
-    # ইউজার যদি server_name না দেয়, তবে এপিআই অটোমেটিক ডিফল্ট 'BD' সার্ভার ধরে নেবে
-    server_name = request.args.get("server_name", "BD").upper()
-    
-    if not uid:
-        return jsonify({
-            "error": "UID is strictly required!"
-        }), 400
+    server_name = request.args.get("server_name", "").upper()
+    if not uid or not server_name:
+        return jsonify({"error": "UID and server_name are required"}), 400
 
     if refresh_in_progress:
-        return jsonify({
-            "status": "refreshing",
-            "message": "Token refresh in progress. Please wait a few moments."
-        }), 503
+        return jsonify({"error": "Token refresh in progress. Please wait a few minutes and try again."}), 503
 
     tokens = all_tokens.copy()
     if not tokens:
-        return jsonify({
-            "status": "empty",
-            "message": "No active tokens found. Please trigger /refresh first."
-        }), 503
+        return jsonify({"error": "No tokens available. Please call /refresh first."}), 503
 
     try:
         encrypted_uid = enc(int(uid))
         if not encrypted_uid:
-            raise Exception("Failed to encrypt player UID safely.")
+            raise Exception("Failed to encrypt UID")
 
         # Get player info before like
         before_info, before_idx = get_player_info(encrypted_uid, server_name, tokens)
@@ -491,19 +494,17 @@ def handle_requests():
         jsone = MessageToJson(before_info)
         data_before = json.loads(jsone)
         before_like = int(data_before.get('AccountInfo', {}).get('Likes', 0))
-        app.logger.info(f"⚡ Initial likes tracked: {before_like}")
+        app.logger.info(f"Initial likes: {before_like}")
 
-        # Dynamic Garena Server URL Routing (Optimized for BD/SG)
+        # Determine URL for like
         if server_name == "IND":
             url = "https://client.ind.freefiremobile.com/LikeProfile"
         elif server_name in {"BR", "US", "SAC", "NA"}:
             url = "https://client.us.freefiremobile.com/LikeProfile"
-        elif server_name in {"BD", "SG"}:
-            url = "https://client.sg.freefiremobile.com/LikeProfile"
         else:
             url = "https://clientbp.ggpolarbear.com/LikeProfile"
 
-        # Fire likes using all valid tokens asynchronously
+        # Send 100 likes using all tokens
         asyncio.run(send_multiple_requests(int(uid), server_name, url, tokens))
 
         # Get player info after like
@@ -513,32 +514,35 @@ def handle_requests():
 
         jsone_after = MessageToJson(after_info)
         data_after = json.loads(jsone_after)
-        
         after_like = int(data_after.get('AccountInfo', {}).get('Likes', 0))
         player_uid = int(data_after.get('AccountInfo', {}).get('UID', 0))
-        player_name = str(data_after.get('AccountInfo', {}).get('PlayerNickname', 'Unknown'))
-        
+        player_name = str(data_after.get('AccountInfo', {}).get('PlayerNickname', ''))
         like_given = after_like - before_like
+        status = 1 if like_given != 0 else 2
 
-        # ইউজার রিকোয়েস্ট অনুযায়ী কাস্টমাইজড প্রিমিয়াম রেসপন্স ফরম্যাট
-        return jsonify({
-            "Name": player_name,
+        # Count tokens by type
+        type_counts = {"guest": 0, "eat": 0, "access": 0}
+        for t in tokens:
+            ttype = t.get("type", "unknown")
+            if ttype in type_counts:
+                type_counts[ttype] += 1
+            else:
+                type_counts[ttype] = 1
+
+        result = {
+            "LikesGivenByAPI": like_given,
+            "LikesafterCommand": after_like,
+            "LikesbeforeCommand": before_like,
+            "PlayerNickname": player_name,
             "UID": player_uid,
-            "Server": server_name,
-            "Before like": before_like,
-            "Givenby api": like_given,
-            "After like": after_like,
-            "Channel": "@FREXY_LIKE",
-            "Owner": "@Frexy1only"
-        }), 200
+            "status": status,
+            
+        }
+        return jsonify(result)
 
     except Exception as e:
-        app.logger.error(f"❌ Main request processing failed: {e}")
-        return jsonify({
-            "status": "failed",
-            "error_log": str(e),
-            "hint": f"Please verify if your tokens support the '{server_name}' region and are fully active."
-        }), 500
+        app.logger.error(f"Main request processing failed: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/jwt', methods=['GET', 'POST'])
