@@ -346,9 +346,9 @@ def eat_token_to_jwt(eat_token: str) -> dict:
         app.logger.error(f"eat_token_to_jwt failed: {e}")
     return None
 
-def guest_to_jwt(uid: str, pass: str) -> dict:
+def guest_to_jwt(uid: str, password: str) -> dict:
     try:
-        params = {"uid": uid, "pass": password}
+        params = {"uid": uid, "password": password}
         resp = requests.get(GUEST_API_URL, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
