@@ -348,72 +348,73 @@ def eat_token_to_jwt(eat_token: str) -> dict:
 
 def guest_to_jwt(uid: str, password: str) -> dict:
     """
-    Guest token conversion with smart retry mechanism.
-    - Maximum 3 attempts per ID
-    - 60 seconds timeout per attempt (waits full 60s only if needed)
-    - If response comes in 3-5 seconds, it processes immediately
-    - Only retries on error/timeout
-    - Multi-threaded support for multiple accounts
+    Guest token conversion with smart timeout.
+    - If response comes within 5 seconds → process immediately (SUCCESS)
+    - If no response within 5 seconds → wait up to 60 seconds
+    - 3 attempts per ID (only if timeout/error occurs)
+    - Shows waiting time in logs and response
     """
     max_attempts = 3
-    timeout_seconds = 60  # Maximum wait time (will wait full 60s only if needed)
+    timeout_seconds = 60  # Maximum wait time
     
     for attempt in range(1, max_attempts + 1):
         start_time = time.time()
         try:
             app.logger.info(f"🔄 Attempt {attempt}/{max_attempts} for UID: {uid}")
+            app.logger.info(f"⏳ Waiting for response... (max {timeout_seconds}s)")
             
             params = {
                 "uid": uid,
                 "password": password
             }
             
-            # Will wait up to 60 seconds, but if response comes in 3-5s, it returns immediately
+            # This will wait up to 60 seconds for response
             resp = requests.get(GUEST_API_URL, params=params, timeout=timeout_seconds)
             elapsed_time = time.time() - start_time
+            
+            app.logger.info(f"📥 Response received in {elapsed_time:.2f} seconds for UID: {uid}")
             resp.raise_for_status()
             data = resp.json()
             
-            app.logger.info(f"📥 Response for UID {uid} received in {elapsed_time:.2f}s")
-            
-            # Check status - support both formats
+            # Check status
             status = data.get("Status") or data.get("status")
             
             if status == "success":
-                # Extract token - support multiple field names
+                # Extract token
                 jwt_token = data.get("Token") or data.get("token") or data.get("jwt")
                 account_uid = data.get("account_id") or data.get("uid") or data.get("account_uid") or uid
                 region = data.get("region") or data.get("lock_region") or data.get("noti_region") or "BD"
                 
                 if jwt_token:
-                    app.logger.info(f"✅ SUCCESS: UID {uid} - Token generated in {elapsed_time:.2f}s (attempt {attempt})")
+                    app.logger.info(f"✅ SUCCESS: UID {uid} - Token generated in {elapsed_time:.2f}s")
                     return {
                         "uid": str(account_uid),
                         "token": jwt_token,
                         "region": region,
-                        "type": "guest"
+                        "type": "guest",
+                        "response_time": f"{elapsed_time:.2f}s"
                     }
                 else:
                     app.logger.warning(f"⚠️ UID {uid} - Token missing in response (attempt {attempt})")
-                    app.logger.warning(f"   Available keys: {list(data.keys())}")
             else:
                 error_msg = data.get("message") or data.get("error") or "Unknown error"
-                app.logger.warning(f"⚠️ UID {uid} - API returned status '{status}' (attempt {attempt}): {error_msg}")
+                app.logger.warning(f"⚠️ UID {uid} - API returned '{status}' (attempt {attempt}): {error_msg}")
                 
         except requests.Timeout:
-            app.logger.warning(f"⏰ UID {uid} - Timeout after {timeout_seconds}s (attempt {attempt}/{max_attempts})")
+            elapsed_time = time.time() - start_time
+            app.logger.warning(f"⏰ UID {uid} - Timeout after {elapsed_time:.2f}s (attempt {attempt}/{max_attempts})")
         except requests.ConnectionError:
             app.logger.warning(f"🔌 UID {uid} - Connection error (attempt {attempt}/{max_attempts})")
         except requests.RequestException as e:
             app.logger.warning(f"❌ UID {uid} - Request failed (attempt {attempt}): {str(e)}")
         except json.JSONDecodeError as e:
-            app.logger.warning(f"📄 UID {uid} - Invalid JSON response (attempt {attempt}): {str(e)}")
+            app.logger.warning(f"📄 UID {uid} - Invalid JSON (attempt {attempt}): {str(e)}")
         except Exception as e:
             app.logger.error(f"💥 UID {uid} - Unexpected error (attempt {attempt}): {str(e)}")
         
-        # If not successful and not last attempt, wait 1 second before retry
+        # Wait 1 second before retry (if not last attempt)
         if attempt < max_attempts:
-            app.logger.info(f"⏳ Waiting 1s before retry {attempt + 1}/{max_attempts} for UID {uid}")
+            app.logger.info(f"⏳ Waiting 1s before retry {attempt + 1}/{max_attempts}")
             time.sleep(1)
     
     app.logger.error(f"❌ FAILED: UID {uid} - All {max_attempts} attempts failed")
@@ -433,8 +434,9 @@ def refresh_all_tokens():
     new_tokens = []
     success_count = 0
     fail_count = 0
+    total_time_start = time.time()
 
-    # Guest accounts (accounts.txt) - Multi-threaded support
+    # Guest accounts (accounts.txt)
     if os.path.exists("accounts.txt"):
         with open("accounts.txt", "r") as f:
             lines = f.readlines()
@@ -455,11 +457,11 @@ def refresh_all_tokens():
                 if jwt:
                     new_tokens.append(jwt)
                     success_count += 1
-                    app.logger.info(f"✅ Added token for UID: {uid}")
+                    app.logger.info(f"✅ Added token for UID: {uid} (took {jwt.get('response_time', 'N/A')})")
                 else:
                     fail_count += 1
                     app.logger.error(f"❌ Failed to get token for UID: {uid}")
-                time.sleep(0.5)  # Small delay between accounts
+                time.sleep(0.5)
     else:
         app.logger.warning("⚠️ accounts.txt not found")
 
@@ -500,19 +502,22 @@ def refresh_all_tokens():
     # Replace global list
     all_tokens = new_tokens
     last_refresh_time = datetime.now()
+    total_elapsed = time.time() - total_time_start
 
     with refresh_lock:
         refresh_in_progress = False
     
     app.logger.info("=" * 80)
     app.logger.info("📊 TOKEN REFRESH COMPLETED")
+    app.logger.info(f"⏱️  Total time: {total_elapsed:.2f}s")
     app.logger.info(f"✅ Successful: {success_count}")
     app.logger.info(f"❌ Failed: {fail_count}")
     app.logger.info(f"📊 Total tokens: {len(all_tokens)}")
     if all_tokens:
         app.logger.info("📝 Token details:")
-        for idx, token_info in enumerate(all_tokens[:5], 1):  # Show first 5
-            app.logger.info(f"   {idx}. UID: {token_info.get('uid')}, Region: {token_info.get('region')}, Type: {token_info.get('type')}")
+        for idx, token_info in enumerate(all_tokens[:5], 1):
+            response_time = token_info.get('response_time', 'N/A')
+            app.logger.info(f"   {idx}. UID: {token_info.get('uid')}, Region: {token_info.get('region')}, Time: {response_time}")
         if len(all_tokens) > 5:
             app.logger.info(f"   ... and {len(all_tokens) - 5} more")
     app.logger.info("=" * 80)
@@ -611,7 +616,7 @@ def refresh():
     def refresh_task():
         refresh_all_tokens()
     threading.Thread(target=refresh_task, daemon=True).start()
-    return jsonify({"message": "🚀 Token refresh started. It may take a few minutes. Check /ch for status."}), 202
+    return jsonify({"message": "🚀 Token refresh started. Check /ch for status."}), 202
 
 @app.route('/ch', methods=['GET'])
 def status():
@@ -620,10 +625,17 @@ def status():
         ttype = t.get("type", "unknown")
         token_types[ttype] = token_types.get(ttype, 0) + 1
     
+    # Calculate average response time
+    avg_time = 0
+    times = [float(t.get('response_time', '0').replace('s', '')) for t in all_tokens if t.get('response_time')]
+    if times:
+        avg_time = sum(times) / len(times)
+    
     return jsonify({
         "refresh_in_progress": refresh_in_progress,
         "total_tokens": len(all_tokens),
         "token_types": token_types,
+        "average_response_time": f"{avg_time:.2f}s" if avg_time else "N/A",
         "last_refresh": str(last_refresh_time) if last_refresh_time else "never"
     })
 
