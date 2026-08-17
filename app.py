@@ -75,7 +75,7 @@ MajorLoginRes = _globals_major_res['MajorLoginRes']
 # ========================== CONFIGURATION ==========================
 AES_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])   # "Yg&tc%DEuh6%Zc^8"
 AES_IV = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])  # "6oyZDr22E3ychjM%"
-GUEST_API_URL = "https://sheihk-jwt.up.railway.app/token"
+GUEST_API_URL = "https://frexy-jwt-gen.vercel.app/token"
 TOKEN_REFRESH_INTERVAL_HOURS = 6
 
 # Global token cache (in‑memory, persists across requests within the same instance)
@@ -140,7 +140,7 @@ def make_request(encrypted_uid: str, server_name: str, token: str):
             'X-GA': "v1 1",
             'ReleaseVersion': "OB54"
         }
-        resp = requests.post(url, data=edata, headers=headers, verify=False)
+        resp = requests.post(url, data=edata, headers=headers, verify=False, timeout=30)
         hex_data = resp.content.hex()
         binary = bytes.fromhex(hex_data)
         info = like_count_pb2.Info()
@@ -165,7 +165,7 @@ async def send_request(encrypted_uid: str, token: str, url: str):
             'ReleaseVersion': "OB54"
         }
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=edata, headers=headers) as response:
+            async with session.post(url, data=edata, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as response:
                 return await response.text() if response.status == 200 else None
     except Exception as e:
         app.logger.error(f"send_request exception: {e}")
@@ -347,44 +347,62 @@ def eat_token_to_jwt(eat_token: str) -> dict:
     return None
 
 def guest_to_jwt(uid: str, password: str) -> dict:
-    try:
-        params = {
-            "uid": uid,
-            "pass": password
-        }
-        
-        resp = requests.get(GUEST_API_URL, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        
-        # বড় হাতের Status এবং ছোট হাতের status উভয়ই হ্যান্ডেল করা হচ্ছে
-        status = data.get("Status") or data.get("status")
-        
-        if status == "success":
-            # API Response অনুযায়ী Capitalized Keys পড়া হচ্ছে
-            account_uid = data.get("account_id") or data.get("uid") or uid
-            jwt_token = data.get("Token") or data.get("token") or data.get("jwt")
-            region = data.get("region") or data.get("lock_region") or "BD"
+    """
+    Guest token conversion with retry mechanism.
+    - 3 attempts per ID
+    - 60 seconds timeout per attempt
+    - Logs success/failure per ID
+    """
+    max_attempts = 3
+    timeout_seconds = 60
+    
+    for attempt in range(1, max_attempts + 1):
+        try:
+            app.logger.info(f"Attempt {attempt}/{max_attempts} for UID: {uid}")
             
-            if jwt_token:
-                app.logger.info(f"Successfully loaded token for UID: {account_uid}")
-                return {
-                    "uid": str(account_uid),
-                    "token": jwt_token,
-                    "region": region,
-                    "type": "guest"
-                }
+            params = {
+                "uid": uid,
+                "password": password  # Changed from 'pass' to 'password' as per new endpoint
+            }
+            
+            resp = requests.get(GUEST_API_URL, params=params, timeout=timeout_seconds)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            # Handle both uppercase and lowercase status
+            status = data.get("Status") or data.get("status")
+            
+            if status == "success":
+                account_uid = data.get("account_id") or data.get("uid") or uid
+                jwt_token = data.get("Token") or data.get("token") or data.get("jwt")
+                region = data.get("region") or data.get("lock_region") or "BD"
+                
+                if jwt_token:
+                    app.logger.info(f"✅ SUCCESS: UID {uid} - Token generated successfully on attempt {attempt}")
+                    return {
+                        "uid": str(account_uid),
+                        "token": jwt_token,
+                        "region": region,
+                        "type": "guest"
+                    }
+                else:
+                    app.logger.warning(f"⚠️ UID {uid} - Token missing in response on attempt {attempt}")
             else:
-                app.logger.error(f"Token missing in response for UID: {uid}")
-        else:
-            app.logger.error(f"API returned unsuccessful status for UID {uid}: {data}")
-
-    except Exception as e:
-        app.logger.error(f"Guest token fetch failed for {uid}: {e}")
+                app.logger.warning(f"⚠️ UID {uid} - API returned status '{status}' on attempt {attempt}: {data}")
+                
+        except requests.Timeout:
+            app.logger.warning(f"⏰ UID {uid} - Timeout on attempt {attempt}/{max_attempts} (waited {timeout_seconds}s)")
+        except requests.RequestException as e:
+            app.logger.warning(f"❌ UID {uid} - Request failed on attempt {attempt}: {str(e)}")
+        except Exception as e:
+            app.logger.error(f"💥 UID {uid} - Unexpected error on attempt {attempt}: {str(e)}")
+        
+        # Wait before next attempt (except after last attempt)
+        if attempt < max_attempts:
+            time.sleep(1)
+    
+    app.logger.error(f"❌ FAILED: UID {uid} - All {max_attempts} attempts failed")
     return None
-
-
-
 
 # ========================== TOKEN REFRESH ==========================
 def refresh_all_tokens():
@@ -394,8 +412,12 @@ def refresh_all_tokens():
             return
         refresh_in_progress = True
 
-    app.logger.info("Starting full token refresh...")
+    app.logger.info("=" * 60)
+    app.logger.info("STARTING FULL TOKEN REFRESH")
+    app.logger.info("=" * 60)
     new_tokens = []
+    success_count = 0
+    fail_count = 0
 
     # Guest accounts (accounts.txt)
     if os.path.exists("accounts.txt"):
@@ -410,6 +432,9 @@ def refresh_all_tokens():
                 jwt = guest_to_jwt(uid.strip(), pwd.strip())
                 if jwt:
                     new_tokens.append(jwt)
+                    success_count += 1
+                else:
+                    fail_count += 1
                 time.sleep(0.5)
     else:
         app.logger.warning("accounts.txt not found")
@@ -424,6 +449,9 @@ def refresh_all_tokens():
                 jwt = eat_token_to_jwt(line)
                 if jwt:
                     new_tokens.append(jwt)
+                    success_count += 1
+                else:
+                    fail_count += 1
                 time.sleep(0.5)
     else:
         app.logger.warning("eat.txt not found")
@@ -438,6 +466,9 @@ def refresh_all_tokens():
                 jwt = access_token_to_jwt(line)
                 if jwt:
                     new_tokens.append(jwt)
+                    success_count += 1
+                else:
+                    fail_count += 1
                 time.sleep(0.5)
     else:
         app.logger.warning("access.txt not found")
@@ -448,7 +479,13 @@ def refresh_all_tokens():
 
     with refresh_lock:
         refresh_in_progress = False
-    app.logger.info(f"Token refresh completed. Total tokens: {len(all_tokens)}")
+    
+    app.logger.info("=" * 60)
+    app.logger.info(f"TOKEN REFRESH COMPLETED")
+    app.logger.info(f"✅ Successful: {success_count}")
+    app.logger.info(f"❌ Failed: {fail_count}")
+    app.logger.info(f"📊 Total tokens: {len(all_tokens)}")
+    app.logger.info("=" * 60)
 
 def scheduled_refresh():
     """Background thread – will be ignored on Vercel."""
