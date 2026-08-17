@@ -348,16 +348,18 @@ def eat_token_to_jwt(eat_token: str) -> dict:
 
 def guest_to_jwt(uid: str, password: str) -> dict:
     """
-    Guest token conversion with retry mechanism.
-    - 3 attempts per ID
-    - Exactly 60 seconds timeout per attempt
+    Guest token conversion with smart retry mechanism.
+    - Maximum 3 attempts per ID
+    - 60 seconds timeout per attempt (waits full 60s only if needed)
+    - If response comes in 3-5 seconds, it processes immediately
+    - Only retries on error/timeout
     - Multi-threaded support for multiple accounts
-    - Logs success/failure per ID
     """
     max_attempts = 3
-    timeout_seconds = 60  # Exactly 60 seconds as requested
+    timeout_seconds = 60  # Maximum wait time (will wait full 60s only if needed)
     
     for attempt in range(1, max_attempts + 1):
+        start_time = time.time()
         try:
             app.logger.info(f"🔄 Attempt {attempt}/{max_attempts} for UID: {uid}")
             
@@ -366,13 +368,13 @@ def guest_to_jwt(uid: str, password: str) -> dict:
                 "password": password
             }
             
-            # Exactly 60 seconds timeout
+            # Will wait up to 60 seconds, but if response comes in 3-5s, it returns immediately
             resp = requests.get(GUEST_API_URL, params=params, timeout=timeout_seconds)
+            elapsed_time = time.time() - start_time
             resp.raise_for_status()
             data = resp.json()
             
-            # Log full response for debugging
-            app.logger.info(f"📥 Response for UID {uid} (attempt {attempt}): {json.dumps(data, indent=2)}")
+            app.logger.info(f"📥 Response for UID {uid} received in {elapsed_time:.2f}s")
             
             # Check status - support both formats
             status = data.get("Status") or data.get("status")
@@ -384,7 +386,7 @@ def guest_to_jwt(uid: str, password: str) -> dict:
                 region = data.get("region") or data.get("lock_region") or data.get("noti_region") or "BD"
                 
                 if jwt_token:
-                    app.logger.info(f"✅ SUCCESS: UID {uid} - Token generated successfully on attempt {attempt} in {timeout_seconds}s")
+                    app.logger.info(f"✅ SUCCESS: UID {uid} - Token generated in {elapsed_time:.2f}s (attempt {attempt})")
                     return {
                         "uid": str(account_uid),
                         "token": jwt_token,
@@ -392,28 +394,29 @@ def guest_to_jwt(uid: str, password: str) -> dict:
                         "type": "guest"
                     }
                 else:
-                    app.logger.warning(f"⚠️ UID {uid} - Token missing in response on attempt {attempt}")
+                    app.logger.warning(f"⚠️ UID {uid} - Token missing in response (attempt {attempt})")
                     app.logger.warning(f"   Available keys: {list(data.keys())}")
             else:
                 error_msg = data.get("message") or data.get("error") or "Unknown error"
-                app.logger.warning(f"⚠️ UID {uid} - API returned status '{status}' on attempt {attempt}: {error_msg}")
+                app.logger.warning(f"⚠️ UID {uid} - API returned status '{status}' (attempt {attempt}): {error_msg}")
                 
         except requests.Timeout:
-            app.logger.warning(f"⏰ UID {uid} - Timeout on attempt {attempt}/{max_attempts} (waited exactly {timeout_seconds}s)")
+            app.logger.warning(f"⏰ UID {uid} - Timeout after {timeout_seconds}s (attempt {attempt}/{max_attempts})")
         except requests.ConnectionError:
-            app.logger.warning(f"🔌 UID {uid} - Connection error on attempt {attempt}/{max_attempts}")
+            app.logger.warning(f"🔌 UID {uid} - Connection error (attempt {attempt}/{max_attempts})")
         except requests.RequestException as e:
-            app.logger.warning(f"❌ UID {uid} - Request failed on attempt {attempt}: {str(e)}")
+            app.logger.warning(f"❌ UID {uid} - Request failed (attempt {attempt}): {str(e)}")
         except json.JSONDecodeError as e:
-            app.logger.warning(f"📄 UID {uid} - Invalid JSON response on attempt {attempt}: {str(e)}")
+            app.logger.warning(f"📄 UID {uid} - Invalid JSON response (attempt {attempt}): {str(e)}")
         except Exception as e:
-            app.logger.error(f"💥 UID {uid} - Unexpected error on attempt {attempt}: {str(e)}")
+            app.logger.error(f"💥 UID {uid} - Unexpected error (attempt {attempt}): {str(e)}")
         
-        # Wait 1 second between attempts (as requested)
+        # If not successful and not last attempt, wait 1 second before retry
         if attempt < max_attempts:
+            app.logger.info(f"⏳ Waiting 1s before retry {attempt + 1}/{max_attempts} for UID {uid}")
             time.sleep(1)
     
-    app.logger.error(f"❌ FAILED: UID {uid} - All {max_attempts} attempts failed (each waited {timeout_seconds}s)")
+    app.logger.error(f"❌ FAILED: UID {uid} - All {max_attempts} attempts failed")
     return None
 
 # ========================== TOKEN REFRESH ==========================
